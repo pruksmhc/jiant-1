@@ -1,46 +1,48 @@
-import copy
-import math
-import numpy as np
+from typing import Dict
 from dataclasses import dataclass
-from typing import Any
-
+import copy
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, SequentialSampler
-
-from pyutils.display import maybe_tqdm, maybe_trange
-from nlpr.shared.runner import (
-    BaseRunner,
-    convert_examples_to_dataset,
-    HybridLoader,
+from torch import nn
+import jiant.tasks.evaluate as evaluate
+import jiant.utils.torch_utils as torch_utils
+from jiant.proj.main.components.container_setup import JiantTaskContainer
+from jiant.proj.main.modeling.primary import JiantModel, wrap_jiant_forward
+from jiant.shared.constants import PHASE
+from jiant.shared.runner import (
     complex_backpropagate,
-    get_sampler,
-    TrainGlobalState,
-    optim_step_grad_accum,
+    get_train_dataloader_from_cache,
+    get_eval_dataloader_from_cache,
 )
+from jiant.utils.display import maybe_tqdm
+from jiant.utils.python.datastructures import InfiniteYield, ExtendedDataClassMixin
+
 
 @dataclass
-class MeanTeacherParameters:
-    alpha: float
+class BregmanParameters:
     consistency_type: str
     consistency_weight: float
-    consistency_ramp_up_steps: int
-    use_unsup: bool
-    unsup_ratio: int
 
 
 @dataclass
-class TrainDataDuplet:
-    sup: Any
-    unsup: Any
+class RunnerParameters(ExtendedDataClassMixin):
+    local_rank: int
+    n_gpu: int
+    fp16: bool
+    max_grad_norm: float
 
 
-def create_teacher(model_wrapper: model_setup.ModelWrapper) -> model_setup.ModelWrapper:
-    return model_setup.ModelWrapper(
-        model=copy.deepcopy(model_wrapper.model),
-        tokenizer=model_wrapper.tokenizer,
-    )
+@dataclass
+class TrainState(ExtendedDataClassMixin):
+    global_steps: int
+    task_steps: Dict[str, int]
 
+    @classmethod
+    def from_task_name_list(cls, task_name_list):
+        return cls(global_steps=0, task_steps={task_name: 0 for task_name in task_name_list})
+
+    def step(self, task_name):
+        self.task_steps[task_name] += 1
+        self.global_steps += 1
 
 def sigmoid_rampup(current, rampup_length):
     """Exponential rampup from https://arxiv.org/abs/1610.02242"""
@@ -52,7 +54,7 @@ def sigmoid_rampup(current, rampup_length):
         return float(np.exp(-5.0 * phase * phase))
 
 
-def get_current_consistency_weight(global_step, mt_params: MeanTeacherParameters):
+def get_current_consistency_weight(global_step, mt_params: BregmanParameters):
     # Consistency ramp-up from https://arxiv.org/abs/1610.02242
     # Maybe do epochs?
     return (
@@ -86,7 +88,7 @@ def softmax_kl_loss(input_logits, target_logits):
     return F.kl_div(input_log_softmax, target_softmax, size_average=False)
 
 
-def compute_raw_consistency_loss(student_logits, teacher_logits, mt_params: MeanTeacherParameters):
+def compute_raw_consistency_loss(student_logits, teacher_logits, mt_params: BregmanParameters):
     if mt_params.consistency_type == "kl":
         raw_consistency_loss = softmax_kl_loss(
             input_logits=student_logits,
@@ -102,70 +104,30 @@ def compute_raw_consistency_loss(student_logits, teacher_logits, mt_params: Mean
     return raw_consistency_loss
 
 
-class MeanTeacherRunner(BaseRunner):
-    def __init__(self, task, model_wrapper, jiant_task_container: JiantTaskContainer, optimizer_scheduler,  loss_criterion,
-                 device, rparams: simple_runner.RunnerParameters, mt_params: MeanTeacherParameters, 
-                 log_writer):
-        self.task = task
-        self.model_wrapper = model_wrapper
+class BregmanRunner:
+    def __init__(
+            self,
+            jiant_task_container: JiantTaskContainer,
+            jiant_model: JiantModel,
+            optimizer_scheduler,
+            device,
+            rparams: RunnerParameters,
+            mt_params: BregmanParameters,
+            log_writer,
+    ):
+        self.jiant_task_container = jiant_task_container
+        self.jiant_model = jiant_model
+        self.teacher_model = copy.deepcopy(jiant_model)
         self.optimizer_scheduler = optimizer_scheduler
-        self.teacher_model_wrapper = create_teacher(model_wrapper) 
-        self.loss_criterion = loss_criterion
         self.device = device
         self.rparams = rparams
-        self.mt_params = mt_params
         self.log_writer = log_writer
+        self.mt_params = mt_params
+        self.model = self.jiant_model
 
-        # Convenience
-        self.model = self.model_wrapper.model
-
-    def run_train(self, task_data, verbose=True):
-
-        dataloader_duplet = self.get_train_dataloaders(
-            task_data=task_data,
-            verbose=verbose,
-        )
-        train_global_state = TrainGlobalState()
-        for epoch_i in \
-                maybe_trange(int(self.train_schedule.num_train_epochs), desc="Epoch", verbose=verbose):
-            train_global_state.epoch = epoch_i
-            self.run_train_epoch(dataloader_duplet, train_global_state)
-            results = self.run_val(val_examples=self.task.get_val_examples())
-            self.log_writer.write_entry("val_metric", {
-                "epoch": train_global_state.epoch,
-                "metric": results["metrics"].asdict(),
-            })
-            self.log_writer.flush()
-
-    def run_train_epoch(self,
-                        dataloader_duplet: TrainDataDuplet,
-                        train_global_state: TrainGlobalState, verbose=True):
-        for _ in self.run_train_epoch_context(
-                dataloader_duplet=dataloader_duplet,
-                train_global_state=train_global_state,
-                verbose=verbose):
+    def run_train(self):
+        for _ in self.run_train_context():
             pass
-
-    def run_train_epoch_context(self,
-                                dataloader_duplet: TrainDataDuplet,
-                                train_global_state: TrainGlobalState, verbose=True):
-        self.teacher_model_wrapper.requires_grad = False
-        train_iterator = maybe_tqdm(zip(
-            dataloader_duplet.sup,
-            dataloader_duplet.unsup,
-        ), desc="Training", verbose=verbose, total=len(dataloader_duplet.sup))
-
-        for sup_batch, unsup_batch in train_iterator:
-            train_dataloader_dict = TrainDataDuplet(
-                sup=sup_batch,
-                unsup=unsup_batch,
-            )
-            self.run_train_step(
-                train_dataloader_dict=batch_duplet,
-                train_global_state=train_global_state,
-            )
-            yield train_dataloader_dict, train_global_state
-        train_global_state.step_epoch()
 
     def run_train_context(self, verbose=True):
         train_dataloader_dict = self.get_train_dataloader_dict()
@@ -173,24 +135,24 @@ class MeanTeacherRunner(BaseRunner):
             self.jiant_task_container.task_run_config.train_task_list
         )
         for _ in maybe_tqdm(
-            range(self.jiant_task_container.global_train_config.max_steps),
-            desc="Training",
-            verbose=verbose,
+                range(self.jiant_task_container.global_train_config.max_steps),
+                desc="Training",
+                verbose=verbose,
         ):
             self.run_train_step(
                 train_dataloader_dict=train_dataloader_dict, train_state=train_state
             )
             yield train_state
 
-   def resume_train_context(self, train_state, verbose=True):
+    def resume_train_context(self, train_state, verbose=True):
         train_dataloader_dict = self.get_train_dataloader_dict()
         start_position = train_state.global_steps
         for _ in maybe_tqdm(
-            range(start_position, self.jiant_task_container.global_train_config.max_steps),
-            desc="Training",
-            initial=start_position,
-            total=self.jiant_task_container.global_train_config.max_steps,
-            verbose=verbose,
+                range(start_position, self.jiant_task_container.global_train_config.max_steps),
+                desc="Training",
+                initial=start_position,
+                total=self.jiant_task_container.global_train_config.max_steps,
+                verbose=verbose,
         ):
             self.run_train_step(
                 train_dataloader_dict=train_dataloader_dict, train_state=train_state
@@ -198,113 +160,60 @@ class MeanTeacherRunner(BaseRunner):
             yield train_state
 
     def get_runner_state(self):
+        # TODO: ADD PREVIOUS STATE AS WELL
         # TODO: Add fp16  (Issue #46)
         state = {
             "model": torch_utils.get_model_for_saving(self.jiant_model).state_dict(),
             "optimizer": self.optimizer_scheduler.optimizer.state_dict(),
+            "past_optimizer": self.teacher_model_wrapper.model.state_dict()
         }
         return state
 
+    def run_train_step(self, train_dataloader_dict: dict, train_state: TrainState):
+        # TODO: TIME TO LOOK AND SEE HOW TO DO THIS
+        self.jiant_model.train()
+        task_name, task = self.jiant_task_container.task_sampler.pop()
+        task_specific_config = self.jiant_task_container.task_specific_configs[task_name]
 
-    def run_train_step(self,  train_dataloader_dict: dict, train_state: TrainState):
-        self.model.train()
-
-        sup_batch = train_dataloader_dict.sup.to(self.device)
-
-        # Classification [SUP]
-        sup_logits = forward_batch_delegate(
-            model=self.model,
-            batch=sup_batch.batch,
-            omit_label_ids=True,
-            task_type=self.task.TASK_TYPE,
-        )[0]
-        classification_loss = compute_loss_from_model_output(
-            logits=sup_logits,
-            loss_criterion=self.loss_criterion,
-            batch=sup_batch.batch,
-            task_type=self.task.TASK_TYPE,
-        )
-        # Consistency
-        with torch.no_grad():
-            teacher_sup_logits = forward_batch_delegate(
-                model=self.teacher_model_wrapper.model,
-                batch=sup_batch.batch,
-                omit_label_ids=True,
-                task_type=self.task.TASK_TYPE,
-            )[0]
-
-        # Consistency
-        if self.mt_params.use_unsup:
-            unsup_batch = train_dataloader_dict.unsup.to(self.device)
-            unsup_logits = forward_batch_delegate(
-                model=self.model,
-                batch=unsup_batch.batch,
-                omit_label_ids=True,
-                task_type=self.task.TASK_TYPE,
-            )[0]
-            teacher_unsup_logits = forward_batch_delegate(
-                model=self.teacher_model_wrapper.model,
-                batch=unsup_batch.batch,
-                omit_label_ids=True,
-                task_type=self.task.TASK_TYPE,
-            )[0]
-            student_logits = torch.cat([sup_logits, unsup_logits], dim=0)
-            teacher_logits = torch.cat([teacher_sup_logits, teacher_unsup_logits], dim=0)
-        else:
-            student_logits = sup_logits
-            teacher_logits = teacher_sup_logits
-
-        raw_consistency_loss = compute_raw_consistency_loss(
-            student_logits=student_logits,
-            teacher_logits=teacher_logits,
-            mt_params=self.mt_params,
-        )
-        consistency_weight = get_current_consistency_weight(
-            global_step=train_global_state.global_step,
-            mt_params=self.mt_params,
-        )
-        consistency_loss = consistency_weight * raw_consistency_loss
-
-        # Combine
-        loss = classification_loss + consistency_loss
-        loss = self.complex_backpropagate(loss)
-
-        optim_step_grad_accum(
-            optimizer_scheduler=self.optimizer_scheduler,
-            train_global_state=train_global_state,
-            gradient_accumulation_steps=self.train_schedule.gradient_accumulation_steps,
-        )
-        self.teacher_model_wrapper = self.model_wrapper
-        self.teacher_model_wrapper.requires_grad = False
-        self.log_writer.write_entry("loss_train", {
-            "epoch": train_global_state.epoch,
-            "epoch_step": train_global_state.epoch_step,
-            "global_step": train_global_state.global_step,
-            "classification_loss": classification_loss.item(),
-            "consistency_loss": consistency_loss.item(),
-            "total_loss": loss.item(),
-            "pred_entropy": compute_pred_entropy_clean(sup_logits)
-        })
-
-    def _get_eval_dataloader_dict(self, phase, task_name_list, use_subset=False):
-        val_dataloader_dict = {}
-        for task_name in task_name_list:
-            task = self.jiant_task_container.task_dict[task_name]
-            eval_cache = self.jiant_task_container.task_cache_dict[task_name][phase]
-            task_specific_config = self.jiant_task_container.task_specific_configs[task_name]
-            val_dataloader_dict[task_name] = get_eval_dataloader_from_cache(
-                eval_cache=eval_cache,
-                task=task,
-                eval_batch_size=task_specific_config.eval_batch_size,
-                subset_num=task_specific_config.eval_subset_num if use_subset else None,
+        loss_val = 0
+        for i in range(task_specific_config.gradient_accumulation_steps):
+            batch, batch_metadata = train_dataloader_dict[task_name].pop()
+            batch = batch.to(self.device)
+            sup_model_output = wrap_jiant_forward(
+                jiant_model=self.jiant_model, batch=batch, task=task, compute_loss=True,
             )
-        return val_dataloader_dict
-
-    def get_val_dataloader_dict(self, task_name_list, use_subset=False):
-        return self._get_eval_dataloader_dict(
-            phase="val", task_name_list=task_name_list, use_subset=use_subset,
+            classification_loss = self.complex_backpropagate(
+                loss=sup_model_output.loss,
+                gradient_accumulation_steps=task_specific_config.gradient_accumulation_steps,
+            )
+            with torch.no_grad():
+                prev_sup_logits = wrap_jiant_forward(
+                jiant_model=self.teacher_model, batch=batch, task=task, compute_loss=True,
+            )
+            raw_consistency_loss = compute_raw_consistency_loss(
+                student_logits=sup_model_output,
+                teacher_logits=prev_sup_logits,
+                mt_params=self.mt_params,
+            )
+            consistency_weight = self.mt_params.consistency_weight
+            consistency_loss = consistency_weight * raw_consistency_loss
+            loss = classification_loss + consistency_loss
+            loss = self.complex_backpropagate(loss)
+            loss_val += loss.item()
+        self.teacher_model = self.jiant_model
+        self.teacher_model.requires_grad = False
+        self.optimizer_scheduler.step()
+        self.optimizer_scheduler.optimizer.zero_grad()
+        train_state.step(task_name=task_name)
+        self.log_writer.write_entry(
+            "loss_train",
+            {
+                "task": task_name,
+                "task_step": train_state.task_steps[task_name],
+                "global_step": train_state.global_steps,
+                "loss_val": loss_val / task_specific_config.gradient_accumulation_steps,
+            },
         )
-
 
     def run_val(self, task_name_list, use_subset=None, return_preds=False, verbose=True):
         evaluate_dict = {}
@@ -343,28 +252,6 @@ class MeanTeacherRunner(BaseRunner):
             )
         return evaluate_dict
 
-
-    def run_test(self, test_examples, verbose=True):
-        test_dataloader = self.get_eval_dataloader(test_examples)
-        self.model.eval()
-        all_logits = []
-        for step, (batch, batch_metadata) in enumerate(
-                maybe_tqdm(test_dataloader, desc="Predictions (Test)", verbose=verbose)):
-            batch = batch.to(self.device)
-            with torch.no_grad():
-                logits = forward_batch_delegate(
-                    model=self.model,
-                    batch=batch,
-                    omit_label_ids=True,
-                    task_type=self.task.TASK_TYPE,
-                )[0]
-            logits = logits.detach().cpu().numpy()
-            all_logits.append(logits)
-
-        all_logits = np.concatenate(all_logits, axis=0)
-        return all_logits
-
-
     def get_train_dataloader_dict(self):
         # Not currently supported distributed parallel
         train_dataloader_dict = {}
@@ -381,12 +268,78 @@ class MeanTeacherRunner(BaseRunner):
             )
         return train_dataloader_dict
 
-    def get_sup_train_dataloader(self, task_data, verbose=True):
-        return self.get_single_train_dataloader(
-            train_examples=task_data["sup"]["train"],
-            verbose=verbose,
-            batch_size=self.train_schedule.train_batch_size
+    def _get_eval_dataloader_dict(self, phase, task_name_list, use_subset=False):
+        val_dataloader_dict = {}
+        for task_name in task_name_list:
+            task = self.jiant_task_container.task_dict[task_name]
+            eval_cache = self.jiant_task_container.task_cache_dict[task_name][phase]
+            task_specific_config = self.jiant_task_container.task_specific_configs[task_name]
+            val_dataloader_dict[task_name] = get_eval_dataloader_from_cache(
+                eval_cache=eval_cache,
+                task=task,
+                eval_batch_size=task_specific_config.eval_batch_size,
+                subset_num=task_specific_config.eval_subset_num if use_subset else None,
+            )
+        return val_dataloader_dict
+
+    def get_val_dataloader_dict(self, task_name_list, use_subset=False):
+        return self._get_eval_dataloader_dict(
+            phase="val", task_name_list=task_name_list, use_subset=use_subset,
         )
+
+    def get_val_labels_dict(self, task_name_list, use_subset=False):
+        val_labels_dict = {}
+        for task_name in task_name_list:
+            task_specific_config = self.jiant_task_container.task_specific_configs[task_name]
+            val_labels_cache = self.jiant_task_container.task_cache_dict[task_name]["val_labels"]
+            val_labels = val_labels_cache.get_all()
+            if use_subset:
+                val_labels = val_labels[: task_specific_config.eval_subset_num]
+            val_labels_dict[task_name] = val_labels
+        return val_labels_dict
+
+    def get_test_dataloader_dict(self):
+        return self._get_eval_dataloader_dict(
+            task_name_list=self.jiant_task_container.task_run_config.test_task_list,
+            phase=PHASE.TEST,
+        )
+
+    def complex_backpropagate(self, loss, gradient_accumulation_steps):
+        return complex_backpropagate(
+            loss=loss,
+            optimizer=self.optimizer_scheduler.optimizer,
+            model=self.jiant_model,
+            fp16=self.rparams.fp16,
+            n_gpu=self.rparams.n_gpu,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            max_grad_norm=self.rparams.max_grad_norm,
+        )
+
+    def get_runner_state(self):
+        # TODO: Add fp16  (Issue #46)
+        state = {
+            "model": torch_utils.get_model_for_saving(self.jiant_model).state_dict(),
+            "optimizer": self.optimizer_scheduler.optimizer.state_dict(),
+        }
+        return state
+
+    def load_state(self, runner_state):
+        torch_utils.get_model_for_saving(self.jiant_model).load_state_dict(runner_state["model"])
+        self.optimizer_scheduler.optimizer.load_state_dict(runner_state["optimizer"])
+
+
+class CheckpointSaver:
+    def __init__(self, metadata, save_path):
+        self.metadata = metadata
+        self.save_path = save_path
+
+    def save(self, runner_state: dict, metarunner_state: dict):
+        to_save = {
+            "runner_state": runner_state,
+            "metarunner_state": metarunner_state,
+            "metadata": self.metadata,
+        }
+        torch_utils.safe_save(to_save, self.save_path)
 
 
 def run_val(

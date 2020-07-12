@@ -7,6 +7,7 @@ import jiant.proj.main.export_model as export_model
 import jiant.proj.main.tokenize_and_cache as tokenize_and_cache
 import jiant.proj.main.scripts.configurator as configurator
 import jiant.proj.main.runscript as runscript
+import jiant.proj.bregman_loss.runner as runner
 import jiant.shared.distributed as distributed
 import jiant.utils.zconf as zconf
 import jiant.utils.python.io as py_io
@@ -63,6 +64,10 @@ class RunConfiguration(zconf.RunConfig):
     local_rank = zconf.attr(default=-1, type=int)
     server_ip = zconf.attr(default="", type=str)
     server_port = zconf.attr(default="", type=str)
+    consistency_type = zconf.attr(default="KL", type=str)
+    consistency_weight = zconf.attr(default=0.0, type=float)
+
+
 
     def _post_init(self):
         assert (
@@ -182,6 +187,7 @@ def run_simple(args: RunConfiguration):
         model_weights_path = os.path.join(
             model_cache_path, args.model_type, "model", f"{args.model_type}.p"
         )
+
     runscript.run_loop(
         runscript.RunConfiguration(
             # === Required parameters === #

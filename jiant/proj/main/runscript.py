@@ -4,6 +4,7 @@ import torch
 
 import jiant.proj.main.modeling.model_setup as jiant_model_setup
 import jiant.proj.main.runner as jiant_runner
+import jiant.proj.bregman_loss.runner as bregman_runner
 import jiant.proj.main.components.container_setup as container_setup
 import jiant.proj.main.metarunner as jiant_metarunner
 import jiant.proj.main.components.evaluate as jiant_evaluate
@@ -113,24 +114,28 @@ def setup_runner(
         local_rank=args.local_rank,
     )
     optimizer_scheduler.optimizer = optimizer
-    rparams = jiant_runner.RunnerParameters(
-        local_rank=args.local_rank,
-        n_gpu=quick_init_out.n_gpu,
-        fp16=args.fp16,
-        max_grad_norm=args.max_grad_norm,
-    )
-    runner = jiant_runner.JiantRunner(
-        jiant_task_container=jiant_task_container,
+
+    if type == "bregman":\
+        rparams = bregman_runner.RunnerParameters(
+            local_rank=args.local_rank,
+            n_gpu=quick_init_out.n_gpu,
+            fp16=args.fp16,
+            max_grad_norm=args.max_grad_norm,
+        )
+
+        mt_params = bregman_runner.BregmanParameters(consistency_type=args.consistency_type, consistency_weight=args.consistency_weight)
+        runner = bregman_runner.BregmanRunner( jiant_task_container=jiant_task_container,
         jiant_model=jiant_model,
         optimizer_scheduler=optimizer_scheduler,
         device=quick_init_out.device,
         rparams=rparams,
-        log_writer=quick_init_out.log_writer,
-    )
+        mt_params=mt_params,
+        log_writer=quick_init_out.log_writer,)
+
     return runner
 
 
-def run_loop(args: RunConfiguration, checkpoint=None):
+def run_loop(args: RunConfiguration, checkpoint=None, type="bregman"):
     is_resumed = checkpoint is not None
     quick_init_out = initialization.quick_init(args=args, verbose=True)
     print(quick_init_out.n_gpu)
@@ -143,6 +148,7 @@ def run_loop(args: RunConfiguration, checkpoint=None):
             jiant_task_container=jiant_task_container,
             quick_init_out=quick_init_out,
             verbose=True,
+            type=type
         )
         if is_resumed:
             runner.load_state(checkpoint["runner_state"])
