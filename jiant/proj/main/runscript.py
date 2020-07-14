@@ -56,7 +56,8 @@ class RunConfiguration(zconf.RunConfig):
     local_rank = zconf.attr(default=-1, type=int)
     server_ip = zconf.attr(default="", type=str)
     server_port = zconf.attr(default="", type=str)
-
+    consistency_type =  zconf.attr(default="KL", type=str)
+    consistency_weight = zconf.attr(default=0.0, type=float)
 
 @zconf.run_config
 class ResumeConfiguration(zconf.RunConfig):
@@ -68,6 +69,7 @@ def setup_runner(
     jiant_task_container: container_setup.JiantTaskContainer,
     quick_init_out,
     verbose: bool = True,
+    type: str = "bregman"
 ) -> jiant_runner.JiantRunner:
     """Setup jiant model, optimizer, and runner, and return runner.
 
@@ -115,14 +117,13 @@ def setup_runner(
     )
     optimizer_scheduler.optimizer = optimizer
 
-    if type == "bregman":\
+    if type == "bregman":
         rparams = bregman_runner.RunnerParameters(
             local_rank=args.local_rank,
             n_gpu=quick_init_out.n_gpu,
             fp16=args.fp16,
             max_grad_norm=args.max_grad_norm,
         )
-
         mt_params = bregman_runner.BregmanParameters(consistency_type=args.consistency_type, consistency_weight=args.consistency_weight)
         runner = bregman_runner.BregmanRunner( jiant_task_container=jiant_task_container,
         jiant_model=jiant_model,

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import copy
 import torch
 from torch import nn
+from torch.nn import functional as F
 import jiant.tasks.evaluate as evaluate
 import jiant.utils.torch_utils as torch_utils
 from jiant.proj.main.components.container_setup import JiantTaskContainer
@@ -63,17 +64,17 @@ def get_current_consistency_weight(global_step, mt_params: BregmanParameters):
     )
 
 
-def softmax_mse_loss(input_logits, target_logits):
+def softmax_mse_loss(input_logits,  target_logits):
     # From https://github.com/CuriousAI/mean-teacher/
     #       blob/bd4313d5691f3ce4c30635e50fa207f49edf16fe/pytorch/mean_teacher/losses.py
-    assert input_logits.size() == target_logits.size()
-    input_softmax = F.softmax(input_logits, dim=1)
+    assert input_logits.logits.size() == target_logits.size()
+    input_softmax = F.softmax(input_logits,  dim=1)
     target_softmax = F.softmax(target_logits, dim=1)
-    num_classes = input_logits.size()[1]
+    num_classes = input_logits.logits.size()[1]
     return F.mse_loss(input_softmax, target_softmax, size_average=False) / num_classes
 
 
-def softmax_kl_loss(input_logits, target_logits):
+def softmax_kl_loss(input_logits,  target_logits):
     # From https://github.com/CuriousAI/mean-teacher/
     #       blob/bd4313d5691f3ce4c30635e50fa207f49edf16fe/pytorch/mean_teacher/losses.py
     """Takes softmax on both sides and returns KL divergence
@@ -82,14 +83,14 @@ def softmax_kl_loss(input_logits, target_logits):
       if you want the mean.
     - Sends gradients to inputs but not the targets.
     """
-    assert input_logits.size() == target_logits.size()
-    input_log_softmax = F.log_softmax(input_logits, dim=1)
-    target_softmax = F.softmax(target_logits, dim=1)
+    assert input_logits.logits.size() == target_logits.logits.size()
+    input_log_softmax = F.log_softmax(input_logits.logits,  dim=1)
+    target_softmax = F.softmax(target_logits.logits, dim=1)
     return F.kl_div(input_log_softmax, target_softmax, size_average=False)
 
 
 def compute_raw_consistency_loss(student_logits, teacher_logits, mt_params: BregmanParameters):
-    if mt_params.consistency_type == "kl":
+    if mt_params.consistency_type == "KL":
         raw_consistency_loss = softmax_kl_loss(
             input_logits=student_logits,
             target_logits=teacher_logits,
@@ -182,10 +183,6 @@ class BregmanRunner:
             sup_model_output = wrap_jiant_forward(
                 jiant_model=self.jiant_model, batch=batch, task=task, compute_loss=True,
             )
-            classification_loss = self.complex_backpropagate(
-                loss=sup_model_output.loss,
-                gradient_accumulation_steps=task_specific_config.gradient_accumulation_steps,
-            )
             with torch.no_grad():
                 prev_sup_logits = wrap_jiant_forward(
                 jiant_model=self.teacher_model, batch=batch, task=task, compute_loss=True,
@@ -195,10 +192,11 @@ class BregmanRunner:
                 teacher_logits=prev_sup_logits,
                 mt_params=self.mt_params,
             )
+            classification_loss = sup_model_output.loss
             consistency_weight = self.mt_params.consistency_weight
             consistency_loss = consistency_weight * raw_consistency_loss
             loss = classification_loss + consistency_loss
-            loss = self.complex_backpropagate(loss)
+            loss = self.complex_backpropagate(loss, gradient_accumulation_steps=task_specific_config.gradient_accumulation_steps)
             loss_val += loss.item()
         self.teacher_model = self.jiant_model
         self.teacher_model.requires_grad = False
